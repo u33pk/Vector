@@ -17,4 +17,10 @@ if [ -f /data/adb/.gook_lsp ]; then
 fi
 
 # Start the daemon directly in the background within a private mount namespace
-unshare --propagation slave -m "$MODDIR/daemon" --system-server-max-retry=3 "$@" &
+# gook 轨道加重试:注入编排器与新 zygote 的 system_server fork 是毫秒级竞速,
+# 前 3 次可能全输(热启动 preload 仅 5-8s),放宽到 30 让 watcher 补注入收敛。
+if [ -f /data/adb/.gook_lsp ]; then
+  unshare --propagation slave -m "$MODDIR/daemon" --system-server-max-retry=30 "$@" &
+else
+  unshare --propagation slave -m "$MODDIR/daemon" --system-server-max-retry=3 "$@" &
+fi
