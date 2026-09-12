@@ -18,6 +18,7 @@
  */
 #include <android/log.h>
 #include <dlfcn.h>
+#include <cstring>
 #include <jni.h>
 #include <pthread.h>
 
@@ -60,6 +61,12 @@ struct GklspFace {
 static GklspFace g_gk;
 static JavaVM *g_vm;
 static const struct lsp_bridge *g_bridge;
+static uint64_t g_bridge_va;
+
+/* P13 W2:层级 B 接线(gook_tierb.cpp;scope 模式时由 on_process_ready
+ * 在 InitHooks 后调用)。 */
+int tierb_run(JNIEnv *env, jobject fw_loader, const struct lsp_bridge *bridge,
+              uint64_t bridge_va);
 
 /* 桥页 +0x100 = libgklsp C 导出函数指针表(10×u64;host 代 dlsym ——
  * 适配层运行在 app 主线程 namespace,无法 dlopen/RTLD_NOLOAD 到 daemon
@@ -248,6 +255,23 @@ int GookContext::on_process_ready(JNIEnv *env, const struct lsp_bridge *bridge) 
     InitHooks(env);
     if (env->ExceptionCheck()) env->ExceptionClear();
 
+    /* 4.5 P13 W2:层级 B —— 桥页 +0x150 存在 'GVK1' magic(host 侧
+     * --scope 全链)则切换真 framework 链:桥 dex 装载 → hook
+     * getLegacyModules/getModules → forkCommon 驱动(Vector 原生装载
+     * 循环跑,模块经 hook 供给)。否则维持 P12 probe 闭环。 */
+    {
+        uint32_t magic = 0;
+        uint64_t bdva = 0;
+        memcpy(&bdva, (const void *)(uintptr_t)(g_bridge_va + 0x150), 8);
+        memcpy(&magic, (const void *)(uintptr_t)(g_bridge_va + 0x150 + 12), 4);
+        LOGI("tierb probe: magic=%#x bdva=%llx bva=%llx", magic,
+             (unsigned long long)bdva, (unsigned long long)g_bridge_va);
+        if (magic == 0x314B5647) {
+            LOGI("tier-B mode (scope cfg present)");
+            return tierb_run(env, GetCurrentClassLoader(), bridge, g_bridge_va);
+        }
+    }
+
     /* 5) 回证:hook Objects.toString → gk.VHook.callback(经本进程六字段
      * 链装出的 hook)。host VERIFY 期望 "VHOOK:<arg>"。 */
     SetupEntryClass(env);
@@ -313,6 +337,7 @@ extern "C" __attribute__((visibility("default"))) int gk_vector_entry(
     }
     if (g_vm == nullptr && env->GetJavaVM(&g_vm) != JNI_OK) return -2;
     g_bridge = (const struct lsp_bridge *)bridge_va;
+    g_bridge_va = bridge_va;
     if (!g_bridge || g_bridge->version != LSP_BRIDGE_VERSION) {
         LOGE("lsp_bridge version mismatch (%u)", g_bridge ? g_bridge->version : 0);
         return -10;

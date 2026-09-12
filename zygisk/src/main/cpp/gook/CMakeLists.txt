@@ -72,4 +72,4 @@ target_compile_definitions(vector_gook PRIVATE FMT_HEADER_ONLY=1)
 target_link_options(vector_gook PRIVATE -static-libstdc++)
 
 # 资源钩子 + 原生 API 桥桩(边界内:层级 B 前不注册)
-target_sources(vector_gook PRIVATE gook_stub_res.cpp)
+target_sources(vector_gook PRIVATE gook_stub_res.cpp gook_tierb.cpp)
