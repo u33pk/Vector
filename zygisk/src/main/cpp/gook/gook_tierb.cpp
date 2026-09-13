@@ -51,8 +51,11 @@ using namespace vector::native;
 /* ---- 配置块读取(桥页 = 注入器侧缓冲,进程内直接可读) ---- */
 static const uint8_t *g_cfg;   /* 桥页基址(gook_adapter 转交) */
 
+/* 单条记录实际跨度 408B:apk[96]+entries[256]+n_dex(4)+flags(4)
+ * +dex_va[4]×8+dex_size[4]×4。初版 384 是算错 —— n≥2 时第 i 条的
+ * dex_size 会落在第 i+1 条的 apk 槽内(宿主端 vector.rs 已同修)。 */
 static const uint8_t *cfg_module(size_t i) {
-    return g_cfg + 0x200 + 8 + i * 384;
+    return g_cfg + 0x200 + 8 + i * 408;
 }
 
 /* str: 桥页 NUL 终结定长字段 */
@@ -317,8 +320,18 @@ static jobject nLoadAll(JNIEnv *env, jclass c, jobjectArray a) {
         "()Ljava/lang/ClassLoader;");
     jobject fw_loader = env->CallObjectMethod(xb, gcl);
     LOGI("loadAll: step2 fw_loader=%p", fw_loader);
-    jmethodID lc = env->GetMethodID(clc, "loadClass",
-        "(Ljava/lang/String;)Ljava/lang/Class;");
+    /* loadClass 在 ClassLoader 上(不在 Class 上),签名
+     * (Ljava/lang/String;)Ljava/lang/Class;。此前类与返回类型各错一处:
+     * 类错 → 恒 null → CallObjectMethod(mid=null) = checked-JNI FATAL
+     * abort 杀进程(p18w4 实录,即 w15/w16"挂死"真身)。 */
+    jclass clc_loader = env->FindClass("java/lang/ClassLoader");
+    jmethodID lc = clc_loader ? env->GetMethodID(clc_loader, "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;") : nullptr;
+    if (!lc) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        LOGE("loadAll: ClassLoader.loadClass not found");
+        return nullptr;
+    }
     auto load = [&](const char *name) -> jclass {
         jobject o = env->CallObjectMethod(fw_loader, lc,
             env->NewStringUTF(name));
@@ -366,11 +379,9 @@ static jobject nLoadAll(JNIEnv *env, jclass c, jobjectArray a) {
         return nullptr;
     }
 
-    jclass alc = env->FindClass("java/util/ArrayList");
-    jmethodID alc_init = env->GetMethodID(alc, "<init>", "()V");
-    jmethodID add = env->GetMethodID(alc, "add", "(Ljava/lang/Object;)Z");
     jclass bbc = env->FindClass("java/nio/ByteBuffer");
     jobjectArray bufarr = nullptr;
+    uint32_t ok_ct = 0;
 
     for (uint32_t i = 0; i < n; i++) {
         const uint8_t *rec = cfg_module(i);
@@ -381,12 +392,22 @@ static jobject nLoadAll(JNIEnv *env, jclass c, jobjectArray a) {
         std::string entries = cfg_str(rec + 96, 256);
 
         /* dex → DirectByteBuffer(ghost va 进程内可读,零拷贝) */
+        LOGI("loadAll: s5a module %u pkg=%s dex=%u entries=%s",
+             i, pkg.c_str(), n_dex, entries.c_str());
         bufarr = env->NewObjectArray(n_dex, bbc, nullptr);
         for (uint32_t j = 0; j < n_dex; j++) {
             uint64_t va; uint32_t sz;
             memcpy(&va, rec + 96 + 256 + 8 + j * 8, 8);
             memcpy(&sz, rec + 96 + 256 + 8 + 32 + j * 4, 4);
+            LOGI("loadAll: s5b NDBB i=%u j=%u va=%llx sz=%u",
+                 i, j, (unsigned long long)va, sz);
             jobject bb = env->NewDirectByteBuffer((void *)(uintptr_t)va, sz);
+            /* 不解引用 ghost va(坏 va 由 dex verify 路径 SIGSEGV +
+             * tombstone 显形);只校验 JNI 包装的一致性。 */
+            if (bb && ((uintptr_t)env->GetDirectBufferAddress(bb) !=
+                           (uintptr_t)va ||
+                       (uint64_t)env->GetDirectBufferCapacity(bb) != sz))
+                LOGE("loadAll: NDBB mismatch i=%u j=%u", i, j);
             env->SetObjectArrayElement(bufarr, j, bb);
         }
         jobject dexlist = env->CallStaticObjectMethod(
@@ -421,9 +442,11 @@ static jobject nLoadAll(JNIEnv *env, jclass c, jobjectArray a) {
             std::string cn = entries.substr(pos, comma - pos);
             pos = comma + 1;
             jstring jcn = env->NewStringUTF(cn.c_str());
+            LOGI("loadAll: s8 loadClass %s", cn.c_str());
             jclass mod_c = (jclass)env->CallObjectMethod(mcl, mcl_load, jcn);
             if (!mod_c || env->ExceptionCheck()) {
-                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (env->ExceptionCheck()) env->ExceptionDescribe();
+                env->ExceptionClear();
                 LOGE("loadAll: %s not loadable", cn.c_str());
                 continue;
             }
@@ -432,19 +455,33 @@ static jobject nLoadAll(JNIEnv *env, jclass c, jobjectArray a) {
                 continue;
             }
             jmethodID mctor = env->GetMethodID(mod_c, "<init>", "()V");
-            jobject inst = env->NewObject(mod_c, mctor);
-            if (!inst || env->ExceptionCheck()) {
+            if (!mctor) {
                 if (env->ExceptionCheck()) env->ExceptionClear();
+                LOGE("loadAll: %s no <init>()V", cn.c_str());
                 continue;
             }
-            jobject wparam = env->NewObject(wrapper_c,
-                env->GetMethodID(wrapper_c, "<init>",
-                    "(Lde/robv/android/xposed/IXposedHookLoadPackage;)V"),
-                inst);
-            /* hookLoadPackage(Wrapper) —— 分发由 VectorStartup.bootstrap
-             * 的 ActivityThread/LoadedApk hook 承担。 */
+            jobject inst = env->NewObject(mod_c, mctor);
+            if (!inst || env->ExceptionCheck()) {
+                if (env->ExceptionCheck()) env->ExceptionDescribe();
+                env->ExceptionClear();
+                LOGE("loadAll: %s newInstance failed", cn.c_str());
+                continue;
+            }
+            jmethodID w_ctor = env->GetMethodID(wrapper_c, "<init>",
+                "(Lde/robv/android/xposed/IXposedHookLoadPackage;)V");
+            if (!w_ctor) {
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                LOGE("loadAll: Wrapper <init> mid not found");
+                continue;
+            }
+            jobject wparam = env->NewObject(wrapper_c, w_ctor, inst);
+            /* hookLoadPackage(Wrapper) —— 注册进 XposedBridge 回调集。
+             * 签名必须是 XC_LoadPackage;用 Object 查不到 → GetStaticMethodID
+             * 返 null 且留 pending NoSuchMethodError,不清除则下一个 JNI
+             * 调用 = "No pending exception expected" abort(p18w9 实录)。 */
             jmethodID hlp = env->GetStaticMethodID(xb, "hookLoadPackage",
-                "(Ljava/lang/Object;)V");
+                "(Lde/robv/android/xposed/callbacks/XC_LoadPackage;)V");
+            if (env->ExceptionCheck()) env->ExceptionClear();
             if (hlp) {
                 env->CallStaticVoidMethod(xb, hlp, wparam);
                 if (env->ExceptionCheck()) {
@@ -452,11 +489,69 @@ static jobject nLoadAll(JNIEnv *env, jclass c, jobjectArray a) {
                     env->ExceptionClear();
                 }
             }
-            jobject loaded = env->NewObject(alc, alc_init);
-            env->CallBooleanMethod(loaded, add, inst);
             LOGI("loadAll: %s registered (hookLoadPackage)", cn.c_str());
+            /* late-inject 语义:app 已完全启动,LoadedApk 构造 hook 成过去
+             * 时,框架唯一分发点(LoadedApkCreateCLHooker)不会再触发 ——
+             * 合成 LoadPackageParam 直接派发一次,让模块真的完成 hook
+             * 注册;这正是门禁要回证的路径。 */
+            jclass lpp_c = env->FindClass(
+                "de/robv/android/xposed/callbacks/XC_LoadPackage$LoadPackageParam");
+            if (!lpp_c || env->ExceptionCheck()) {
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                LOGE("loadAll: LoadPackageParam not found");
+                continue;
+            }
+            jclass cow_c = env->FindClass("java/util/concurrent/CopyOnWriteArraySet");
+            jmethodID cow_ctor = cow_c ? env->GetMethodID(cow_c, "<init>", "()V") : nullptr;
+            jmethodID lpp_ctor = lpp_c ? env->GetMethodID(lpp_c, "<init>",
+                "(Ljava/util/concurrent/CopyOnWriteArraySet;)V") : nullptr;
+            if (!cow_ctor || !lpp_ctor) {
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                LOGE("loadAll: LoadPackageParam ctor mid missing");
+                continue;
+            }
+            jobject cow = env->NewObject(cow_c, cow_ctor);
+            jobject lpp = env->NewObject(lpp_c, lpp_ctor, cow);
+            if (!lpp || env->ExceptionCheck()) {
+                if (env->ExceptionCheck()) env->ExceptionDescribe();
+                env->ExceptionClear();
+                LOGE("loadAll: LoadPackageParam ctor failed");
+                continue;
+            }
+            /* 字段查找失败同样会留 pending exception —— 逐个清除。 */
+            jfieldID f;
+            if ((f = env->GetFieldID(lpp_c, "packageName", "Ljava/lang/String;")) != nullptr)
+                env->SetObjectField(lpp, f, env->NewStringUTF(pkg.c_str()));
+            else if (env->ExceptionCheck()) env->ExceptionClear();
+            if ((f = env->GetFieldID(lpp_c, "processName", "Ljava/lang/String;")) != nullptr)
+                env->SetObjectField(lpp, f, env->NewStringUTF(pkg.c_str()));
+            else if (env->ExceptionCheck()) env->ExceptionClear();
+            if ((f = env->GetFieldID(lpp_c, "classLoader", "Ljava/lang/ClassLoader;")) != nullptr)
+                env->SetObjectField(lpp, f, mcl);
+            else if (env->ExceptionCheck()) env->ExceptionClear();
+            if ((f = env->GetFieldID(lpp_c, "isFirstApplication", "Z")) != nullptr)
+                env->SetBooleanField(lpp, f, JNI_FALSE);
+            else if (env->ExceptionCheck()) env->ExceptionClear();
+            jmethodID hlp_m = env->GetMethodID(xilp, "handleLoadPackage",
+                "(Lde/robv/android/xposed/callbacks/XC_LoadPackage$LoadPackageParam;)V");
+            if (!hlp_m) {
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                LOGE("loadAll: handleLoadPackage mid not found");
+                continue;
+            }
+            LOGI("loadAll: s9 dispatch handleLoadPackage %s", cn.c_str());
+            env->CallVoidMethod(inst, hlp_m, lpp);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                LOGE("loadAll: %s handleLoadPackage threw", cn.c_str());
+                continue;
+            }
+            ok_ct++;
+            LOGI("loadAll: %s dispatched ok", cn.c_str());
         }
     }
+    LOGI("loadAll done: ok=%u/%u", ok_ct, n);
     return nullptr;
 }
 
