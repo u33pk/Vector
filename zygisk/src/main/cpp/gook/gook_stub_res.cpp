@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// P12 W2 适配层桩:resources_hook 与 native_api(bridge)属层级 B(Xposed
-// 模块原生 API + 资源钩子可不做,research-lsplant §4);Context::InitHooks
-// 的 RegisterResourcesHook/RegisterNativeApiBridge 调用以空实现承接,
-// HookBridge 照常注册。
+// 适配层桩:仅 native_api(bridge) 仍为桩(Xposed 模块原生 API 的
+// lsplant hook DSL 需 CI 级 clang,本地面编不动);resources_hook 自
+// P14 起真入编,RegisterResourcesHook 由 resources_hook.cpp 提供。
 #include <jni.h>
 
 namespace vector::native::jni {
 
-void RegisterResourcesHook(JNIEnv *) {}
 void RegisterNativeApiBridge(JNIEnv *) {}
 
 }  // namespace vector::native::jni

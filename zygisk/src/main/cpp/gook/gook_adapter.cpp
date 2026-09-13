@@ -91,7 +91,10 @@ static bool gk_bridge_load(uint64_t bridge_va) {
     return true;
 }
 
-/* ---- ConfigBridge 空实现(无 vectord:obfuscation map 空,边界内) ---- */
+/* ---- ConfigBridge(无 vectord:obfmap 供给恒等条目 —— 设备 vector.dex
+ * 未混淆且 mapping.txt 锚定 XResources 保名,resources_hook 的
+ * initXResourcesNative 按前缀 key "android.content.res.XRes" 直查即得
+ * 原名;map 空则该 native 静默返 false,资源钩子降级) ---- */
 namespace {
 class GookConfigBridge final : public ConfigBridge {
 public:
@@ -102,7 +105,8 @@ public:
     }
 
 private:
-    std::map<std::string, std::string> map_;
+    std::map<std::string, std::string> map_{
+        {"android.content.res.XRes", "android.content.res.XRes"}};
 };
 
 /* ---- Context 实现:LoadDex 与 VectorModule 同体(ghost dex 非持有) ---- */

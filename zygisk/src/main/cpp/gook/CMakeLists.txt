@@ -38,27 +38,46 @@ target_compile_definitions(fmt-header-only INTERFACE
 # dobby(native_api 面的原生 hook;非 InitInfo 承载)
 add_subdirectory(${VECTOR_ROOT}/external/dobby dobby-build)
 
-# Vector native 静态库(去 resources_hook/native_api 面 —— Xposed 模块
-# 原生 API 与资源钩子属层级 B;native_api 的 lsplant hook DSL 需 CI 级
-# clang 模板行为,本地面以桩承接)
+# dex_builder(resources_hook buildDummyClassLoader 现场造 dex 用;经典
+# include 路径 —— .ixx modules 仅 lsplant 自家 CMake 用,Android.mk 同款
+# 源集纯 .cc 编译,与 P12 裁剪动机(cxx modules)不冲突)
+set(DB_ROOT ${LSPLANT_ROOT_GOOK}/external/dex_builder)
+add_library(dex_builder_static STATIC
+    ${DB_ROOT}/dex_builder.cc
+    ${DB_ROOT}/dex_helper.cc
+    ${DB_ROOT}/slicer/reader.cc
+    ${DB_ROOT}/slicer/writer.cc
+    ${DB_ROOT}/slicer/dex_ir.cc
+    ${DB_ROOT}/slicer/common.cc
+    ${DB_ROOT}/slicer/dex_format.cc
+    ${DB_ROOT}/slicer/dex_utf8.cc
+    ${DB_ROOT}/slicer/dex_bytecode.cc
+    ${DB_ROOT}/slicer/sha1.cpp)
+target_include_directories(dex_builder_static PUBLIC ${DB_ROOT}/include)
+target_include_directories(dex_builder_static PUBLIC ${DB_ROOT}/external/parallel_hashmap)
+target_link_libraries(dex_builder_static PUBLIC z log)
+
+# Vector native 静态库(去 native_api 面 —— Xposed 模块原生 API 的
+# lsplant hook DSL 需 CI 级 clang 模板行为,本地面以桩承接;
+# resources_hook.cpp 自 P14 起入编 —— 资源钩子真实现)
 file(GLOB NATIVE_GOOK_SOURCES
     ${VECTOR_ROOT}/native/src/*.cpp
     ${VECTOR_ROOT}/native/src/*/*.cpp)
-list(FILTER NATIVE_GOOK_SOURCES EXCLUDE REGEX "resources_hook\\.cpp$")
 list(FILTER NATIVE_GOOK_SOURCES EXCLUDE REGEX "native_api(\\.cpp|_bridge\\.cpp)$")
 add_library(native_gook STATIC ${NATIVE_GOOK_SOURCES})
-target_compile_definitions(native_gook PRIVATE VERSION_CODE=1 VERSION_NAME="gook-p12" FMT_HEADER_ONLY=1)
+target_compile_definitions(native_gook PRIVATE VERSION_CODE=1 VERSION_NAME="gook-p14" FMT_HEADER_ONLY=1)
 target_include_directories(native_gook
     PUBLIC ${VECTOR_ROOT}/native/include ${LSPLANT_ROOT_GOOK}/include
     PRIVATE ${VECTOR_ROOT}/native/src
-            ${VECTOR_ROOT}/external/lsplant/lsplant/src/main/jni/external/dex_builder/external/parallel_hashmap)
+            ${LSPLANT_ROOT_GOOK}/external/dex_builder/include
+            ${LSPLANT_ROOT_GOOK}/external/dex_builder/external/parallel_hashmap)
 target_compile_options(native_gook PRIVATE
     -Wno-c99-extensions -Wno-extra-semi
     -Wno-gnu-flexible-array-initializer
     -Wno-gnu-string-literal-operator-template
     -Wno-gnu-zero-variadic-macro-arguments
     -Wno-variadic-macros -Wno-zero-length-array)
-target_link_libraries(native_gook PUBLIC dobby_static xz_static log fmt-header-only)
+target_link_libraries(native_gook PUBLIC dobby_static xz_static log fmt-header-only dex_builder_static)
 
 add_library(lsplant_gook SHARED IMPORTED)
 set_target_properties(lsplant_gook PROPERTIES
@@ -71,5 +90,6 @@ target_link_libraries(vector_gook PRIVATE native_gook lsplant_gook log)
 target_compile_definitions(vector_gook PRIVATE FMT_HEADER_ONLY=1)
 target_link_options(vector_gook PRIVATE -static-libstdc++)
 
-# 资源钩子 + 原生 API 桥桩(边界内:层级 B 前不注册)
+# 原生 API 桥桩(resources_hook 已真入编,RegisterResourcesHook 由
+# resources_hook.cpp 提供;native_api 面仍在桩上)
 target_sources(vector_gook PRIVATE gook_stub_res.cpp gook_tierb.cpp)
